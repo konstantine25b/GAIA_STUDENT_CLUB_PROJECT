@@ -1,2 +1,4 @@
 openai>=1.40.0
 python-dotenv>=1.0.1
+datasets>=3.0.0
+pandas>=2.0.0
