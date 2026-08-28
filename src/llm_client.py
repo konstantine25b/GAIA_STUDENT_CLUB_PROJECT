@@ -45,6 +45,7 @@ def _sampling_kwargs(
     top_p: float | None = None,
     frequency_penalty: float | None = None,
     presence_penalty: float | None = None,
+    omit_max_tokens: bool = False,
 ) -> dict[str, Any]:
     """Build API sampling args. Omitted keys use provider defaults."""
     overrides = {
@@ -59,6 +60,8 @@ def _sampling_kwargs(
     for key in SAMPLING_KEYS:
         value = overrides[key]
         if value is None:
+            if key == "max_tokens" and omit_max_tokens:
+                continue
             value = sampling.get(key)
         if value is not None:
             params[key] = value
@@ -74,6 +77,7 @@ def chat(
     top_p: float | None = None,
     frequency_penalty: float | None = None,
     presence_penalty: float | None = None,
+    omit_max_tokens: bool = False,
 ) -> str:
     cfg = load_inference_config()
     response = client.chat.completions.create(
@@ -86,6 +90,7 @@ def chat(
             top_p=top_p,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            omit_max_tokens=omit_max_tokens,
         ),
     )
     return response.choices[0].message.content or ""
@@ -98,6 +103,7 @@ def chat_with_retry(
     max_tokens: int | None = None,
     temperature: float | None = None,
     top_p: float | None = None,
+    omit_max_tokens: bool = False,
 ) -> str:
     cfg = load_inference_config()
     attempts = int(cfg.get("retry_on_api_error", 3))
@@ -111,6 +117,7 @@ def chat_with_retry(
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                omit_max_tokens=omit_max_tokens,
             )
         except Exception as exc:  # noqa: BLE001 - retry any API failure
             last_error = exc

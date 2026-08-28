@@ -16,7 +16,8 @@ from src.llm_client import chat_with_retry, load_inference_config
 from src.parser import extract_answer_from_row
 from src.paths import RESULTS_DIR
 
-DEFAULT_RETRY_PARSE_LADDER = [2048, 4096, 8192, 16256]
+DEFAULT_RETRY_PARSE_LADDER: list[int | None] = [2048, 4096, 8192, None]
+UNBOUNDED_MAX_TOKENS = "none"
 
 RAW_RESPONSE_COLUMNS = [
     "trial",
@@ -287,13 +288,21 @@ def _load_results_state(results_csv: Path, n_trials: int) -> dict[tuple[str, int
     return state
 
 
-def _retry_parse_ladder(cfg: dict) -> list[int]:
+def _retry_parse_ladder(cfg: dict) -> list[int | None]:
     value = cfg.get("retry_parse_max_tokens", DEFAULT_RETRY_PARSE_LADDER)
     if value is None:
         return list(DEFAULT_RETRY_PARSE_LADDER)
     if isinstance(value, int):
         return [value] if value > 0 else []
-    return [int(item) for item in value if int(item) > 0]
+    ladder: list[int | None] = []
+    for item in value:
+        if item is None or str(item).strip().lower() in ("", "none", "null"):
+            ladder.append(None)
+            continue
+        tokens = int(item)
+        if tokens > 0:
+            ladder.append(tokens)
+    return ladder
 
 
 def _is_parsed(value) -> bool:
@@ -302,23 +311,42 @@ def _is_parsed(value) -> bool:
     return str(value).strip() != ""
 
 
-def _max_tokens_tried(rows: pd.DataFrame) -> list[int]:
+def _is_unbounded_max_tokens(value) -> bool:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return False
+    return str(value).strip().lower() in ("none", "null", "default")
+
+
+def _max_tokens_tried(rows: pd.DataFrame) -> tuple[list[int], bool]:
     tried: list[int] = []
+    had_unbounded = False
     if rows.empty or "max_tokens" not in rows.columns:
-        return tried
+        return tried, had_unbounded
     for value in rows["max_tokens"]:
+        if _is_unbounded_max_tokens(value):
+            had_unbounded = True
+            continue
         if value is None or value == "" or pd.isna(value):
             continue
         tried.append(int(value))
-    return tried
+    return tried, had_unbounded
 
 
-def _next_retry_max_tokens(tried: list[int], ladder: list[int]) -> int | None:
+def _next_retry_max_tokens(
+    tried: list[int],
+    had_unbounded: bool,
+    ladder: list[int | None],
+) -> tuple[bool, int | None]:
+    """Return (has_next, max_tokens). max_tokens None means omit the API param."""
+    if had_unbounded:
+        return False, None
     highest = max(tried) if tried else 0
     for tokens in ladder:
+        if tokens is None:
+            return True, None
         if tokens > highest:
-            return tokens
-    return None
+            return True, tokens
+    return False, None
 
 
 def _model_trial_progress(
@@ -326,7 +354,7 @@ def _model_trial_progress(
     trial: int,
     raw_df: pd.DataFrame,
     question_ids: list[int],
-    retry_ladder: list[int],
+    retry_ladder: list[int | None],
 ) -> tuple[int, int]:
     expected = len(question_ids)
     if raw_df.empty:
@@ -343,7 +371,7 @@ def _call_cycle_complete(
     trial: int,
     model: str,
     question_id: int,
-    retry_ladder: list[int],
+    retry_ladder: list[int | None],
 ) -> bool:
     rows = raw_df[
         (raw_df["trial"] == trial)
@@ -356,7 +384,8 @@ def _call_cycle_complete(
         return False
     if any(_is_parsed(value) for value in rows["parsed_answer"]):
         return True
-    return _next_retry_max_tokens(_max_tokens_tried(rows), retry_ladder) is None
+    has_next, _ = _next_retry_max_tokens(*_max_tokens_tried(rows), retry_ladder)
+    return not has_next
 
 
 def _trial_initial_complete(
@@ -381,7 +410,7 @@ def _trial_is_complete(
     trial: int,
     raw_df: pd.DataFrame,
     question_ids: list[int],
-    retry_ladder: list[int],
+    retry_ladder: list[int | None],
 ) -> bool:
     for model in models:
         done, expected = _model_trial_progress(
@@ -397,7 +426,7 @@ def _completed_trials(
     models: list[str],
     raw_df: pd.DataFrame,
     question_ids: list[int],
-    retry_ladder: list[int],
+    retry_ladder: list[int | None],
 ) -> list[int]:
     return [
         trial
@@ -411,7 +440,7 @@ def _model_is_complete(
     trials: int,
     raw_df: pd.DataFrame,
     question_ids: list[int],
-    retry_ladder: list[int],
+    retry_ladder: list[int | None],
 ) -> bool:
     for trial in range(1, trials + 1):
         done, expected = _model_trial_progress(
@@ -427,7 +456,7 @@ def _completed_models(
     trials: int,
     raw_df: pd.DataFrame,
     question_ids: list[int],
-    retry_ladder: list[int],
+    retry_ladder: list[int | None],
 ) -> list[str]:
     return [
         model
@@ -455,7 +484,13 @@ def _default_max_tokens(cfg: dict) -> int | None:
 
 def _run_task(task: EvalTask) -> dict:
     prompt = format_prompt(task.question_row)
-    output = chat_with_retry(prompt, model=task.model, max_tokens=task.max_tokens)
+    omit_max_tokens = task.max_tokens is None
+    output = chat_with_retry(
+        prompt,
+        model=task.model,
+        max_tokens=task.max_tokens,
+        omit_max_tokens=omit_max_tokens,
+    )
     pred = extract_answer_from_row(output, task.options) or ""
     return {
         "trial": task.trial,
@@ -464,7 +499,7 @@ def _run_task(task: EvalTask) -> dict:
         "question_category": task.category,
         "correct_answer": task.correct_answer,
         "attempt": task.attempt,
-        "max_tokens": task.max_tokens if task.max_tokens is not None else "",
+        "max_tokens": UNBOUNDED_MAX_TOKENS if omit_max_tokens else task.max_tokens,
         "parse_ok": bool(pred),
         "prompt": prompt,
         "raw_output": output,
@@ -512,10 +547,12 @@ def _build_retry_tasks(
     trial: int,
     df: pd.DataFrame,
     raw_df: pd.DataFrame,
-    retry_max_tokens: int,
-    retry_ladder: list[int],
+    retry_max_tokens: int | None,
+    retry_ladder: list[int | None],
 ) -> list[EvalTask]:
-    if retry_max_tokens <= 0 or raw_df.empty:
+    if raw_df.empty:
+        return []
+    if retry_max_tokens is not None and retry_max_tokens <= 0:
         return []
     df_by_qid = {int(row["question_id"]): row for _, row in df.iterrows()}
     tasks: list[EvalTask] = []
@@ -530,7 +567,10 @@ def _build_retry_tasks(
                 continue
             if any(_is_parsed(value) for value in rows["parsed_answer"]):
                 continue
-            if _next_retry_max_tokens(_max_tokens_tried(rows), retry_ladder) != retry_max_tokens:
+            has_next, next_tokens = _next_retry_max_tokens(
+                *_max_tokens_tried(rows), retry_ladder
+            )
+            if not has_next or next_tokens != retry_max_tokens:
                 continue
             tasks.append(
                 EvalTask(
@@ -729,9 +769,14 @@ def evaluate_run(
                 )
                 if not retries:
                     continue
+                token_label = (
+                    "none (provider default)"
+                    if retry_tokens is None
+                    else str(retry_tokens)
+                )
                 print(
                     f"  Trial {trial}/{trials}: parse retry, "
-                    f"{len(retries)} calls (max_tokens={retry_tokens})"
+                    f"{len(retries)} calls (max_tokens={token_label})"
                 )
                 metadata["current_retry_max_tokens"] = retry_tokens
                 _save_metadata(paths, metadata)
@@ -741,7 +786,11 @@ def evaluate_run(
                     workers,
                     trial=trial,
                     trials=trials,
-                    label=f"parse-retry@{retry_tokens}",
+                    label=(
+                        "parse-retry@none"
+                        if retry_tokens is None
+                        else f"parse-retry@{retry_tokens}"
+                    ),
                 )
                 if not ok:
                     _mark_interrupted()

@@ -18,7 +18,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Run evaluation trial-by-trial: for each trial, every model answers "
-            "all questions, then parse failures are retried at 2048/4096/8192/16256 tokens."
+            "all questions, then parse failures are retried at 2048/4096/8192, "
+            "then once more with no max_tokens cap."
         )
     )
     parser.add_argument(
