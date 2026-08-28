@@ -1,6 +1,7 @@
 {
   "sampling": {},
   "n_trials": 10,
+  "max_workers": 4,
   "retry_on_api_error": 3,
   "retry_delay_seconds": 2
 }

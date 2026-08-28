@@ -18,7 +18,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Run evaluation trial-by-trial: for each trial, every model answers "
-            "all questions, then raw responses are appended to CSV."
+            "all questions in parallel, saving progress after each API call."
         )
     )
     parser.add_argument(
@@ -40,7 +40,19 @@ def main() -> None:
     parser.add_argument(
         "--run-id",
         default=None,
-        help="Optional folder name under results/runs/",
+        help="Folder name under results/runs/ (required with --continue if multiple runs)",
+    )
+    parser.add_argument(
+        "--continue",
+        dest="continue_run",
+        action="store_true",
+        help="Resume the latest run (or --run-id). Skips completed trials.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Parallel API threads (default: config inference.json max_workers)",
     )
     args = parser.parse_args()
 
@@ -50,6 +62,8 @@ def main() -> None:
         n_trials=args.n_trials,
         run_id=args.run_id,
         limit=args.limit,
+        continue_run=args.continue_run,
+        max_workers=args.workers,
     )
     print(f"\nRun directory: {paths.run_dir}")
     print(f"Results: {paths.results_csv}")

@@ -68,10 +68,33 @@ Raise `max_tokens` (e.g. `1024`) if answers look cut off mid-reasoning.
 | Parameter | Value | Why |
 |-----------|-------|-----|
 | `n_trials` | `10` | 10 trial rounds (see run order above) |
+| `max_workers` | `4` | Parallel API threads per trial round |
 | `retry_on_api_error` | `3` | Retry transient API failures |
 | `retry_delay_seconds` | `2` | Wait between retries |
 
-### Further cost cuts
+Progress is saved **after each API call**. Completed trials are never re-run.
+
+### Resume after cancel
+
+```bash
+# Resume latest interrupted run
+python scripts/run_eval.py --continue
+
+# Resume a specific run folder
+python scripts/run_eval.py --continue --run-id 20260828_095309
+```
+
+- **Completed trials** (all models × all questions) are skipped entirely.
+- **Interrupted trial** resumes only missing `(model, question)` calls.
+- `run_metadata.json` tracks `completed_trials`, `current_trial`, and `status`.
+
+### Parallelism
+
+```bash
+python scripts/run_eval.py --workers 8
+```
+
+Raise `--workers` for speed; lower it if you hit API rate limits.
 
 - Lower `n_trials` (e.g. `3` or `5`) in `config/inference.json`
 - Run one model at a time: `python scripts/run_eval.py --model <name>`
@@ -93,7 +116,12 @@ python scripts/run_eval.py --model gemini-2.5-flash-lite --limit 5
 
 # Full run, all models in config/models.txt
 python scripts/run_eval.py
+
+# Resume after Ctrl+C
+python scripts/run_eval.py --continue --run-id <your_run_folder>
 ```
+
+### Further cost cuts
 
 Requires `.env` with `API_KEY` (and optional `LITELLM_BASE_URL`).
 
