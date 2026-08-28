@@ -16,6 +16,8 @@ from src.llm_client import chat_with_retry, load_inference_config
 from src.parser import extract_answer_from_row
 from src.paths import RESULTS_DIR
 
+DEFAULT_RETRY_PARSE_LADDER = [2048, 4096, 8192, 16256]
+
 RAW_RESPONSE_COLUMNS = [
     "trial",
     "llm_model",
@@ -270,19 +272,53 @@ def _load_results_state(results_csv: Path, n_trials: int) -> dict[tuple[str, int
     return state
 
 
+def _retry_parse_ladder(cfg: dict) -> list[int]:
+    value = cfg.get("retry_parse_max_tokens", DEFAULT_RETRY_PARSE_LADDER)
+    if value is None:
+        return list(DEFAULT_RETRY_PARSE_LADDER)
+    if isinstance(value, int):
+        return [value] if value > 0 else []
+    return [int(item) for item in value if int(item) > 0]
+
+
+def _is_parsed(value) -> bool:
+    if value is None or pd.isna(value):
+        return False
+    return str(value).strip() != ""
+
+
+def _max_tokens_tried(rows: pd.DataFrame) -> list[int]:
+    tried: list[int] = []
+    if rows.empty or "max_tokens" not in rows.columns:
+        return tried
+    for value in rows["max_tokens"]:
+        if value is None or value == "" or pd.isna(value):
+            continue
+        tried.append(int(value))
+    return tried
+
+
+def _next_retry_max_tokens(tried: list[int], ladder: list[int]) -> int | None:
+    highest = max(tried) if tried else 0
+    for tokens in ladder:
+        if tokens > highest:
+            return tokens
+    return None
+
+
 def _model_trial_progress(
     model: str,
     trial: int,
     raw_df: pd.DataFrame,
     question_ids: list[int],
-    retry_max_tokens: int,
+    retry_ladder: list[int],
 ) -> tuple[int, int]:
     expected = len(question_ids)
     if raw_df.empty:
         return 0, expected
     done = 0
     for qid in question_ids:
-        if _call_cycle_complete(raw_df, trial, model, qid, retry_max_tokens):
+        if _call_cycle_complete(raw_df, trial, model, qid, retry_ladder):
             done += 1
     return done, expected
 
@@ -292,7 +328,7 @@ def _call_cycle_complete(
     trial: int,
     model: str,
     question_id: int,
-    retry_max_tokens: int,
+    retry_ladder: list[int],
 ) -> bool:
     rows = raw_df[
         (raw_df["trial"] == trial)
@@ -301,16 +337,58 @@ def _call_cycle_complete(
     ]
     if rows.empty:
         return False
-    attempt1 = rows[rows["attempt"] == 1]
-    if attempt1.empty:
+    if rows[rows["attempt"] == 1].empty:
         return False
-    first = attempt1.iloc[-1]
-    parsed = "" if pd.isna(first.parsed_answer) else str(first.parsed_answer).strip()
-    if parsed:
+    if any(_is_parsed(value) for value in rows["parsed_answer"]):
         return True
-    if retry_max_tokens <= 0:
-        return True
-    return not rows[rows["attempt"] == 2].empty
+    return _next_retry_max_tokens(_max_tokens_tried(rows), retry_ladder) is None
+
+
+def _trial_initial_complete(
+    models: list[str],
+    trial: int,
+    raw_df: pd.DataFrame,
+    question_ids: list[int],
+) -> bool:
+    if raw_df.empty:
+        return False
+    initial = raw_df[(raw_df["trial"] == trial) & (raw_df["attempt"] == 1)]
+    have = {
+        (str(model), int(qid))
+        for model, qid in zip(initial["llm_model"], initial["question_id"])
+    }
+    expected = {(model, qid) for model in models for qid in question_ids}
+    return expected.issubset(have)
+
+
+def _trial_is_complete(
+    models: list[str],
+    trial: int,
+    raw_df: pd.DataFrame,
+    question_ids: list[int],
+    retry_ladder: list[int],
+) -> bool:
+    for model in models:
+        done, expected = _model_trial_progress(
+            model, trial, raw_df, question_ids, retry_ladder
+        )
+        if done < expected:
+            return False
+    return True
+
+
+def _completed_trials(
+    trials: int,
+    models: list[str],
+    raw_df: pd.DataFrame,
+    question_ids: list[int],
+    retry_ladder: list[int],
+) -> list[int]:
+    return [
+        trial
+        for trial in range(1, trials + 1)
+        if _trial_is_complete(models, trial, raw_df, question_ids, retry_ladder)
+    ]
 
 
 def _model_is_complete(
@@ -318,11 +396,11 @@ def _model_is_complete(
     trials: int,
     raw_df: pd.DataFrame,
     question_ids: list[int],
-    retry_max_tokens: int,
+    retry_ladder: list[int],
 ) -> bool:
     for trial in range(1, trials + 1):
         done, expected = _model_trial_progress(
-            model, trial, raw_df, question_ids, retry_max_tokens
+            model, trial, raw_df, question_ids, retry_ladder
         )
         if done < expected:
             return False
@@ -334,12 +412,12 @@ def _completed_models(
     trials: int,
     raw_df: pd.DataFrame,
     question_ids: list[int],
-    retry_max_tokens: int,
+    retry_ladder: list[int],
 ) -> list[str]:
     return [
         model
         for model in models
-        if _model_is_complete(model, trials, raw_df, question_ids, retry_max_tokens)
+        if _model_is_complete(model, trials, raw_df, question_ids, retry_ladder)
     ]
 
 
@@ -415,43 +493,43 @@ def _build_initial_tasks(
 
 
 def _build_retry_tasks(
-    model: str,
+    models: list[str],
     trial: int,
     df: pd.DataFrame,
     raw_df: pd.DataFrame,
     retry_max_tokens: int,
+    retry_ladder: list[int],
 ) -> list[EvalTask]:
     if retry_max_tokens <= 0 or raw_df.empty:
         return []
+    df_by_qid = {int(row["question_id"]): row for _, row in df.iterrows()}
     tasks: list[EvalTask] = []
-    for _, row in df.iterrows():
-        qid = int(row["question_id"])
-        rows = raw_df[
-            (raw_df["trial"] == trial)
-            & (raw_df["llm_model"] == model)
-            & (raw_df["question_id"] == qid)
-        ]
-        if rows.empty:
-            continue
-        attempt1 = rows[rows["attempt"] == 1].iloc[-1]
-        parsed = "" if pd.isna(attempt1.parsed_answer) else str(attempt1.parsed_answer).strip()
-        if parsed:
-            continue
-        if not rows[rows["attempt"] == 2].empty:
-            continue
-        tasks.append(
-            EvalTask(
-                trial=trial,
-                model=model,
-                question_id=qid,
-                category=row["category"],
-                options=row["options"],
-                correct_answer=str(row["answer"]).strip().upper(),
-                question_row=row,
-                attempt=2,
-                max_tokens=retry_max_tokens,
+    for model in models:
+        for qid, row in df_by_qid.items():
+            rows = raw_df[
+                (raw_df["trial"] == trial)
+                & (raw_df["llm_model"] == model)
+                & (raw_df["question_id"] == qid)
+            ]
+            if rows.empty:
+                continue
+            if any(_is_parsed(value) for value in rows["parsed_answer"]):
+                continue
+            if _next_retry_max_tokens(_max_tokens_tried(rows), retry_ladder) != retry_max_tokens:
+                continue
+            tasks.append(
+                EvalTask(
+                    trial=trial,
+                    model=model,
+                    question_id=qid,
+                    category=row["category"],
+                    options=row["options"],
+                    correct_answer=str(row["answer"]).strip().upper(),
+                    question_row=row,
+                    attempt=int(rows["attempt"].max()) + 1,
+                    max_tokens=retry_max_tokens,
+                )
             )
-        )
     return tasks
 
 
@@ -462,7 +540,6 @@ def _run_pending_batch(
     *,
     trial: int,
     trials: int,
-    model: str,
     label: str,
 ) -> bool:
     if not pending:
@@ -478,7 +555,7 @@ def _run_pending_batch(
             writer.record(record)
             completed_count += 1
             print(
-                f"[{model}] trial {trial}/{trials} {label} "
+                f"[{task.model}] trial {trial}/{trials} {label} "
                 f"question id={task.question_id} "
                 f"({completed_count}/{len(pending)})"
             )
@@ -505,12 +582,12 @@ def evaluate_run(
     continue_run: bool = False,
     max_workers: int | None = None,
 ) -> RunPaths:
-    """Finish each model (all trials) before the next. Retry parse failures after each trial."""
+    """For each trial, run every model, then retry parse failures with rising max_tokens."""
     cfg = load_inference_config()
     trials = n_trials if n_trials is not None else int(cfg["n_trials"])
     workers = max_workers if max_workers is not None else int(cfg.get("max_workers", 4))
     default_max_tokens = _default_max_tokens(cfg)
-    retry_max_tokens = int(cfg.get("retry_parse_max_tokens", 4096))
+    retry_ladder = _retry_parse_ladder(cfg)
 
     if continue_run:
         if run_id:
@@ -544,6 +621,17 @@ def evaluate_run(
     _sync_results_from_raw(raw_df, results_state, df, trials)
     writer = _RunWriter(paths, results_state, trials, df)
 
+    def _mark_interrupted() -> None:
+        raw_now = _reload_raw(paths)
+        metadata["status"] = "interrupted"
+        metadata["completed_trials"] = _completed_trials(
+            trials, models, raw_now, question_ids, retry_ladder
+        )
+        metadata["completed_models"] = _completed_models(
+            models, trials, raw_now, question_ids, retry_ladder
+        )
+        _save_metadata(paths, metadata)
+
     metadata.update(
         {
             "models": models,
@@ -551,9 +639,13 @@ def evaluate_run(
             "max_workers": workers,
             "inference_config": cfg,
             "dataset_rows": len(df),
-            "run_order": "model_first",
+            "run_order": "trial_first",
+            "retry_parse_max_tokens": retry_ladder,
+            "completed_trials": _completed_trials(
+                trials, models, raw_df, question_ids, retry_ladder
+            ),
             "completed_models": _completed_models(
-                models, trials, raw_df, question_ids, retry_max_tokens
+                models, trials, raw_df, question_ids, retry_ladder
             ),
             "status": "in_progress",
         }
@@ -562,112 +654,111 @@ def evaluate_run(
         metadata["started_at"] = datetime.now(timezone.utc).isoformat()
     _save_metadata(paths, metadata)
 
-    total_questions = len(df)
-
     try:
-        for model_idx, model in enumerate(models, start=1):
+        for trial in range(1, trials + 1):
             raw_df = _reload_raw(paths)
-            if _model_is_complete(model, trials, raw_df, question_ids, retry_max_tokens):
-                print(f"\n=== Model {model_idx}/{len(models)}: {model} — complete, skipping ===")
+            if _trial_is_complete(models, trial, raw_df, question_ids, retry_ladder):
+                print(f"\n=== Trial {trial}/{trials}: already complete, skipping ===")
                 continue
 
-            print(f"\n=== Model {model_idx}/{len(models)}: {model} ===")
-            metadata["current_model"] = model
+            print(f"\n=== Trial {trial}/{trials} ===")
+            metadata["current_trial"] = trial
+            metadata["current_phase"] = "initial"
             _save_metadata(paths, metadata)
 
-            for trial in range(1, trials + 1):
+            for model_idx, model in enumerate(models, start=1):
                 raw_df = _reload_raw(paths)
-                done, expected = _model_trial_progress(
-                    model, trial, raw_df, question_ids, retry_max_tokens
-                )
-                if done >= expected:
-                    print(f"  Trial {trial}/{trials}: already complete, skipping")
-                    continue
-
                 initial = _build_initial_tasks(
                     model, trial, df, raw_df, default_max_tokens
                 )
-                if initial:
+                if not initial:
                     print(
-                        f"  Trial {trial}/{trials}: initial pass, "
-                        f"{len(initial)} calls (max_tokens={default_max_tokens})"
+                        f"  Model {model_idx}/{len(models)} {model}: "
+                        "initial already done"
                     )
-                    metadata["current_trial"] = trial
-                    _save_metadata(paths, metadata)
-                    ok = _run_pending_batch(
-                        initial,
-                        writer,
-                        workers,
-                        trial=trial,
-                        trials=trials,
-                        model=model,
-                        label="initial",
-                    )
-                    if not ok:
-                        metadata["status"] = "interrupted"
-                        _save_metadata(paths, metadata)
-                        return paths
+                    continue
+                print(
+                    f"  Model {model_idx}/{len(models)} {model}: initial pass, "
+                    f"{len(initial)} calls (max_tokens={default_max_tokens})"
+                )
+                metadata["current_model"] = model
+                _save_metadata(paths, metadata)
+                ok = _run_pending_batch(
+                    initial,
+                    writer,
+                    workers,
+                    trial=trial,
+                    trials=trials,
+                    label="initial",
+                )
+                if not ok:
+                    _mark_interrupted()
+                    return paths
 
+            raw_df = _reload_raw(paths)
+            if not _trial_initial_complete(models, trial, raw_df, question_ids):
+                _mark_interrupted()
+                print(
+                    f"  Trial {trial}/{trials} initial pass incomplete. "
+                    "Re-run with --continue."
+                )
+                return paths
+
+            metadata["current_phase"] = "parse_retry"
+            _save_metadata(paths, metadata)
+
+            for retry_tokens in retry_ladder:
                 raw_df = _reload_raw(paths)
                 retries = _build_retry_tasks(
-                    model, trial, df, raw_df, retry_max_tokens
+                    models, trial, df, raw_df, retry_tokens, retry_ladder
                 )
-                if retries:
-                    print(
-                        f"  Trial {trial}/{trials}: parse retry, "
-                        f"{len(retries)} calls (max_tokens={retry_max_tokens})"
-                    )
-                    ok = _run_pending_batch(
-                        retries,
-                        writer,
-                        workers,
-                        trial=trial,
-                        trials=trials,
-                        model=model,
-                        label="parse-retry",
-                    )
-                    if not ok:
-                        metadata["status"] = "interrupted"
-                        _save_metadata(paths, metadata)
-                        return paths
-
-                raw_df = _reload_raw(paths)
-                done, expected = _model_trial_progress(
-                    model, trial, raw_df, question_ids, retry_max_tokens
+                if not retries:
+                    continue
+                print(
+                    f"  Trial {trial}/{trials}: parse retry, "
+                    f"{len(retries)} calls (max_tokens={retry_tokens})"
                 )
-                if done < expected:
-                    metadata["status"] = "interrupted"
-                    metadata["completed_models"] = _completed_models(
-                        models, trials, raw_df, question_ids, retry_max_tokens
-                    )
-                    _save_metadata(paths, metadata)
-                    print(
-                        f"  Trial {trial}/{trials} incomplete for {model} "
-                        f"({done}/{expected}). Re-run with --continue."
-                    )
+                metadata["current_retry_max_tokens"] = retry_tokens
+                _save_metadata(paths, metadata)
+                ok = _run_pending_batch(
+                    retries,
+                    writer,
+                    workers,
+                    trial=trial,
+                    trials=trials,
+                    label=f"parse-retry@{retry_tokens}",
+                )
+                if not ok:
+                    _mark_interrupted()
                     return paths
-                print(f"  Trial {trial}/{trials} complete for {model}.")
 
+            raw_df = _reload_raw(paths)
+            if not _trial_is_complete(models, trial, raw_df, question_ids, retry_ladder):
+                _mark_interrupted()
+                print(
+                    f"  Trial {trial}/{trials} incomplete. Re-run with --continue."
+                )
+                return paths
+
+            metadata["completed_trials"] = _completed_trials(
+                trials, models, raw_df, question_ids, retry_ladder
+            )
             metadata["completed_models"] = _completed_models(
-                models, trials, _reload_raw(paths), question_ids, retry_max_tokens
+                models, trials, raw_df, question_ids, retry_ladder
             )
             _save_metadata(paths, metadata)
             print(
-                f"Model {model} complete "
-                f"({trials} trials × {total_questions} questions)."
+                f"  Trial {trial}/{trials} complete for all {len(models)} models."
             )
 
     except KeyboardInterrupt:
-        metadata["status"] = "interrupted"
-        metadata["completed_models"] = _completed_models(
-            models, trials, _reload_raw(paths), question_ids, retry_max_tokens
-        )
-        _save_metadata(paths, metadata)
+        _mark_interrupted()
         print("\nInterrupted — progress saved. Resume with: --continue --run-id <id>")
         return paths
 
     metadata["status"] = "complete"
+    metadata["completed_trials"] = list(range(1, trials + 1))
     metadata["completed_models"] = list(models)
     _save_metadata(paths, metadata)
-    print(f"\nAll models complete. Run directory: {paths.run_dir}")
+    print(f"\nAll trials complete. Run directory: {paths.run_dir}")
     return paths

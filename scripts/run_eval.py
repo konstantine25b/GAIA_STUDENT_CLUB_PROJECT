@@ -18,7 +18,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Run evaluation trial-by-trial: for each trial, every model answers "
-            "all questions in parallel, saving progress after each API call."
+            "all questions, then parse failures are retried at 2048/4096/8192/16256 tokens."
         )
     )
     parser.add_argument(
