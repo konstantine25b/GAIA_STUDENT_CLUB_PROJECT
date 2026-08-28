@@ -1,16 +1,22 @@
 """Download MMLU-Pro and write 20 random samples per category to CSV."""
 
 import json
+import sys
 from pathlib import Path
 
 import pandas as pd
 from datasets import load_dataset
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.bootstrap import setup_project
+
+setup_project()
+from src.paths import DATASET_CSV
+
 DATASET_ID = "TIGER-Lab/MMLU-Pro"
 SPLIT = "test"
 N_PER_CATEGORY = 20
 SEED = 42
-OUT_PATH = Path("data/mmlu_pro_sample_20_per_category.csv")
 COLUMNS = [
     "question_id",
     "question",
@@ -56,9 +62,9 @@ def get_samples() -> pd.DataFrame:
 
 def main() -> None:
     sampled = get_samples()
-    OUT_PATH.parent.mkdir(exist_ok=True)
-    sampled.to_csv(OUT_PATH, index=False)
-    print(f"wrote {OUT_PATH} ({len(sampled)} rows)")
+    DATASET_CSV.parent.mkdir(parents=True, exist_ok=True)
+    sampled.to_csv(DATASET_CSV, index=False)
+    print(f"wrote {DATASET_CSV} ({len(sampled)} rows)")
 
 
 if __name__ == "__main__":
