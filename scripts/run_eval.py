@@ -10,13 +10,16 @@ from src.bootstrap import setup_project
 setup_project()
 
 from src.dataset import load_models
-from src.evaluator import evaluate_model
+from src.evaluator import evaluate_run
 from src.paths import MODELS_FILE
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run all models on the dataset with n trials per question."
+        description=(
+            "Run evaluation trial-by-trial: for each trial, every model answers "
+            "all questions, then raw responses are appended to CSV."
+        )
     )
     parser.add_argument(
         "--model",
@@ -37,21 +40,20 @@ def main() -> None:
     parser.add_argument(
         "--run-id",
         default=None,
-        help="Optional run folder name under results/runs/<model>/",
+        help="Optional folder name under results/runs/",
     )
     args = parser.parse_args()
 
     models = [args.model] if args.model else load_models(MODELS_FILE)
-    for model in models:
-        print(f"\n=== Starting {model} ===")
-        paths = evaluate_model(
-            model,
-            n_trials=args.n_trials,
-            run_id=args.run_id,
-            limit=args.limit,
-        )
-        print(f"Results: {paths.results_csv}")
-        print(f"Raw log: {paths.raw_jsonl}")
+    paths = evaluate_run(
+        models,
+        n_trials=args.n_trials,
+        run_id=args.run_id,
+        limit=args.limit,
+    )
+    print(f"\nRun directory: {paths.run_dir}")
+    print(f"Results: {paths.results_csv}")
+    print(f"Raw responses: {paths.raw_responses_csv}")
 
 
 if __name__ == "__main__":

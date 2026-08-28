@@ -18,23 +18,36 @@ scripts/
 results/runs/          # output (gitignored)
 ```
 
-## Results storage (10 trials per question)
+## Results storage
 
-Each model run writes to:
+Each full run writes to one folder:
 
 ```
-results/runs/<model_slug>/<run_timestamp>/
-  results.csv          # main table (one row per question)
-  raw_responses.jsonl  # every trial + raw model text (resume/debug)
-  run_metadata.json    # model name, n_trials, inference config
+results/runs/<run_timestamp>/
+  results.csv           # summary: one row per (model, question)
+  raw_responses.csv     # every API call; appended after each trial round
+  run_metadata.json
 ```
 
-`results.csv` columns:
+### Run order
+
+For each **trial** `1 … n_trials`:
+
+1. Model 1 → all 280 questions  
+2. Model 2 → all 280 questions  
+3. …  
+4. Model N → all 280 questions  
+5. **Append** that trial’s rows to `raw_responses.csv` and update `results.csv`
+
+### `results.csv`
 
 `llm_model`, `question_category`, `question_id`, `options`, `correct_answer`,
 `it_1_ans` … `it_10_ans`, `correct_answered_num`, `accuracy`
 
-`accuracy` = `correct_answered_num / n_trials` for that question.
+### `raw_responses.csv`
+
+`trial`, `llm_model`, `question_id`, `question_category`, `correct_answer`,
+`prompt`, `raw_output`, `parsed_answer`
 
 ## Inference parameters
 
@@ -54,8 +67,7 @@ Raise `max_tokens` (e.g. `1024`) if answers look cut off mid-reasoning.
 
 | Parameter | Value | Why |
 |-----------|-------|-----|
-| `n_trials` | `10` | 10 answers per question |
-| `save_full_raw_output` | `false` | Log only `parsed_answer` + 300-char tail in jsonl (not full text) |
+| `n_trials` | `10` | 10 trial rounds (see run order above) |
 | `retry_on_api_error` | `3` | Retry transient API failures |
 | `retry_delay_seconds` | `2` | Wait between retries |
 
