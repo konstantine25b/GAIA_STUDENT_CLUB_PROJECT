@@ -57,7 +57,7 @@ Configured in `config/inference.json`.
 
 | Parameter | Value | Why |
 |-----------|-------|-----|
-| `max_tokens` | `512` | Caps completion length — main lever for API cost |
+| `max_tokens` | `1024` | Caps completion length — main lever for API cost |
 
 Other sampling fields are omitted so the API uses its defaults (`temperature`, `top_p`, etc.).
 
