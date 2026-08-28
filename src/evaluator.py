@@ -75,7 +75,9 @@ class _RunWriter:
         self.paths = paths
         self.results_state = results_state
         self.n_trials = n_trials
-        self.df_by_qid = {int(row.question_id): row for row in df.itertuples()}
+        self.df_by_qid = {
+            int(row["question_id"]): row for _, row in df.iterrows()
+        }
         self._lock = threading.Lock()
 
     def _ensure_result_row(self, model: str, question_id: int, prompt: str) -> None:
@@ -240,7 +242,7 @@ def _sync_results_from_raw(
 ) -> None:
     if raw_df.empty:
         return
-    df_by_qid = {int(row.question_id): row for row in df.itertuples()}
+    df_by_qid = {int(row["question_id"]): row for _, row in df.iterrows()}
     grouped = raw_df.sort_values("attempt").groupby(
         ["trial", "llm_model", "question_id"], sort=False
     )
