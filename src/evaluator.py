@@ -22,9 +22,23 @@ RAW_RESPONSE_COLUMNS = [
     "question_id",
     "question_category",
     "correct_answer",
+    "attempt",
+    "max_tokens",
+    "parse_ok",
     "prompt",
     "raw_output",
     "parsed_answer",
+]
+
+PARSE_LOG_COLUMNS = [
+    "trial",
+    "llm_model",
+    "question_id",
+    "attempt",
+    "max_tokens",
+    "parse_ok",
+    "parsed_answer",
+    "correct_answer",
 ]
 
 
@@ -33,6 +47,7 @@ class RunPaths:
     run_dir: Path
     results_csv: Path
     raw_responses_csv: Path
+    parse_log_csv: Path
     metadata_json: Path
 
 
@@ -45,6 +60,8 @@ class EvalTask:
     options: str
     correct_answer: str
     question_row: pd.Series
+    attempt: int = 1
+    max_tokens: int | None = None
 
 
 class _RunWriter:
@@ -53,41 +70,45 @@ class _RunWriter:
         paths: RunPaths,
         results_state: dict[tuple[str, int], dict],
         n_trials: int,
+        df: pd.DataFrame,
     ) -> None:
         self.paths = paths
         self.results_state = results_state
         self.n_trials = n_trials
+        self.df_by_qid = {int(row.question_id): row for row in df.itertuples()}
         self._lock = threading.Lock()
-        self._done_keys: set[tuple[int, str, int]] = set()
 
-    def seed_done_keys(self, keys: set[tuple[int, str, int]]) -> None:
-        self._done_keys = set(keys)
-
-    def is_done(self, trial: int, model: str, question_id: int) -> bool:
-        return (trial, model, question_id) in self._done_keys
+    def _ensure_result_row(self, model: str, question_id: int, prompt: str) -> None:
+        key = _result_key(model, question_id)
+        if key in self.results_state:
+            if not self.results_state[key].get("prompt"):
+                self.results_state[key]["prompt"] = prompt
+            return
+        row = self.df_by_qid[question_id]
+        result = _empty_result_row(model, row, self.n_trials)
+        result["prompt"] = prompt
+        self.results_state[key] = result
 
     def record(self, record: dict) -> None:
         with self._lock:
             trial = int(record["trial"])
             model = str(record["llm_model"])
             qid = int(record["question_id"])
-            key = (trial, model, qid)
-            if key in self._done_keys:
-                return
+            prompt = str(record["prompt"])
 
-            frame = pd.DataFrame([record], columns=RAW_RESPONSE_COLUMNS)
-            write_header = not self.paths.raw_responses_csv.exists()
-            frame.to_csv(
-                self.paths.raw_responses_csv,
-                mode="a",
-                header=write_header,
-                index=False,
-            )
+            self._append_csv(self.paths.raw_responses_csv, record, RAW_RESPONSE_COLUMNS)
+            self._append_csv(self.paths.parse_log_csv, _parse_log_row(record), PARSE_LOG_COLUMNS)
 
-            result_key = _result_key(model, qid)
-            self.results_state[result_key][f"it_{trial}_ans"] = record["parsed_answer"]
-            self._done_keys.add(key)
+            self._ensure_result_row(model, qid, prompt)
+            parsed = record.get("parsed_answer") or ""
+            if parsed:
+                self.results_state[_result_key(model, qid)][f"it_{trial}_ans"] = parsed
             self._flush_results_unlocked()
+
+    def _append_csv(self, path: Path, record: dict, columns: list[str]) -> None:
+        frame = pd.DataFrame([record], columns=columns)
+        write_header = not path.exists()
+        frame.to_csv(path, mode="a", header=write_header, index=False)
 
     def _flush_results_unlocked(self) -> None:
         rows = [
@@ -95,6 +116,20 @@ class _RunWriter:
             for row in self.results_state.values()
         ]
         _write_results_csv(self.paths.results_csv, rows, self.n_trials)
+
+
+def _parse_log_row(record: dict) -> dict:
+    parsed = record.get("parsed_answer") or ""
+    return {
+        "trial": record["trial"],
+        "llm_model": record["llm_model"],
+        "question_id": record["question_id"],
+        "attempt": record["attempt"],
+        "max_tokens": record["max_tokens"],
+        "parse_ok": bool(parsed),
+        "parsed_answer": parsed,
+        "correct_answer": record["correct_answer"],
+    }
 
 
 def _trial_columns(n_trials: int) -> list[str]:
@@ -108,6 +143,7 @@ def results_columns(n_trials: int) -> list[str]:
         "question_id",
         "options",
         "correct_answer",
+        "prompt",
         *_trial_columns(n_trials),
         "correct_answered_num",
         "accuracy",
@@ -124,6 +160,7 @@ def get_run_paths(run_id: str | None = None, *, must_exist: bool = False) -> Run
         run_dir=run_dir,
         results_csv=run_dir / "results.csv",
         raw_responses_csv=run_dir / "raw_responses.csv",
+        parse_log_csv=run_dir / "parse_log.csv",
         metadata_json=run_dir / "run_metadata.json",
     )
 
@@ -154,6 +191,7 @@ def _empty_result_row(model: str, row: pd.Series, n_trials: int) -> dict:
         "question_id": int(row["question_id"]),
         "options": row["options"],
         "correct_answer": gold,
+        "prompt": "",
         "correct_answered_num": 0,
         "accuracy": 0.0,
     }
@@ -172,90 +210,135 @@ def _finalize_result_row(row: dict, n_trials: int) -> dict:
 
 
 def _write_results_csv(results_csv: Path, rows: list[dict], n_trials: int) -> None:
+    if not rows:
+        return
     df = pd.DataFrame(rows, columns=results_columns(n_trials))
     df = df.sort_values(["llm_model", "question_id"]).reset_index(drop=True)
     df.to_csv(results_csv, index=False)
 
 
-def _load_existing_raw_keys(raw_csv: Path) -> set[tuple[int, str, int]]:
+def _load_raw_df(raw_csv: Path) -> pd.DataFrame:
     if not raw_csv.exists():
-        return set()
+        return pd.DataFrame()
     df = pd.read_csv(raw_csv)
-    return {
-        (int(row.trial), str(row.llm_model), int(row.question_id))
-        for row in df.itertuples(index=False)
-    }
+    if "attempt" not in df.columns:
+        df["attempt"] = 1
+    if "max_tokens" not in df.columns:
+        df["max_tokens"] = ""
+    if "parse_ok" not in df.columns:
+        df["parse_ok"] = df["parsed_answer"].notna() & (
+            df["parsed_answer"].astype(str).str.strip() != ""
+        )
+    return df
 
 
 def _sync_results_from_raw(
-    raw_csv: Path,
+    raw_df: pd.DataFrame,
     results_state: dict[tuple[str, int], dict],
-) -> None:
-    if not raw_csv.exists():
-        return
-    df = pd.read_csv(raw_csv)
-    for row in df.itertuples(index=False):
-        key = _result_key(str(row.llm_model), int(row.question_id))
-        if key not in results_state:
-            continue
-        trial_col = f"it_{int(row.trial)}_ans"
-        parsed = "" if pd.isna(row.parsed_answer) else str(row.parsed_answer)
-        results_state[key][trial_col] = parsed
-
-
-def _load_results_state(
-    results_csv: Path,
-    models: list[str],
     df: pd.DataFrame,
     n_trials: int,
-) -> dict[tuple[str, int], dict]:
-    state: dict[tuple[str, int], dict] = {}
-    if results_csv.exists():
-        existing = pd.read_csv(results_csv)
-        for record in existing.to_dict(orient="records"):
-            key = _result_key(str(record["llm_model"]), int(record["question_id"]))
-            state[key] = record
+) -> None:
+    if raw_df.empty:
+        return
+    df_by_qid = {int(row.question_id): row for row in df.itertuples()}
+    grouped = raw_df.sort_values("attempt").groupby(
+        ["trial", "llm_model", "question_id"], sort=False
+    )
+    for (trial, model, qid), group in grouped:
+        key = _result_key(str(model), int(qid))
+        if key not in results_state:
+            row = df_by_qid[int(qid)]
+            results_state[key] = _empty_result_row(str(model), row, n_trials)
+        prompt = group.iloc[-1].get("prompt", "")
+        if isinstance(prompt, str) and prompt and not results_state[key].get("prompt"):
+            results_state[key]["prompt"] = prompt
+        for _, attempt_row in group.iterrows():
+            parsed = "" if pd.isna(attempt_row.parsed_answer) else str(attempt_row.parsed_answer)
+            if parsed:
+                results_state[key][f"it_{int(trial)}_ans"] = parsed
 
-    for model in models:
-        for _, row in df.iterrows():
-            key = _result_key(model, int(row["question_id"]))
-            if key not in state:
-                state[key] = _empty_result_row(model, row, n_trials)
+
+def _load_results_state(results_csv: Path, n_trials: int) -> dict[tuple[str, int], dict]:
+    if not results_csv.exists():
+        return {}
+    state: dict[tuple[str, int], dict] = {}
+    for record in pd.read_csv(results_csv).to_dict(orient="records"):
+        key = _result_key(str(record["llm_model"]), int(record["question_id"]))
+        state[key] = record
     return state
 
 
-def _expected_calls(models: list[str], question_count: int) -> int:
-    return len(models) * question_count
-
-
-def _trial_progress(
+def _model_trial_progress(
+    model: str,
     trial: int,
-    done_keys: set[tuple[int, str, int]],
-    models: list[str],
+    raw_df: pd.DataFrame,
     question_ids: list[int],
+    retry_max_tokens: int,
 ) -> tuple[int, int]:
-    expected = _expected_calls(models, len(question_ids))
-    done = sum(
-        1
-        for model in models
-        for qid in question_ids
-        if (trial, model, qid) in done_keys
-    )
+    expected = len(question_ids)
+    if raw_df.empty:
+        return 0, expected
+    done = 0
+    for qid in question_ids:
+        if _call_cycle_complete(raw_df, trial, model, qid, retry_max_tokens):
+            done += 1
     return done, expected
 
 
-def _completed_trials(
+def _call_cycle_complete(
+    raw_df: pd.DataFrame,
+    trial: int,
+    model: str,
+    question_id: int,
+    retry_max_tokens: int,
+) -> bool:
+    rows = raw_df[
+        (raw_df["trial"] == trial)
+        & (raw_df["llm_model"] == model)
+        & (raw_df["question_id"] == question_id)
+    ]
+    if rows.empty:
+        return False
+    attempt1 = rows[rows["attempt"] == 1]
+    if attempt1.empty:
+        return False
+    first = attempt1.iloc[-1]
+    parsed = "" if pd.isna(first.parsed_answer) else str(first.parsed_answer).strip()
+    if parsed:
+        return True
+    if retry_max_tokens <= 0:
+        return True
+    return not rows[rows["attempt"] == 2].empty
+
+
+def _model_is_complete(
+    model: str,
     trials: int,
-    done_keys: set[tuple[int, str, int]],
-    models: list[str],
+    raw_df: pd.DataFrame,
     question_ids: list[int],
-) -> list[int]:
-    completed: list[int] = []
+    retry_max_tokens: int,
+) -> bool:
     for trial in range(1, trials + 1):
-        done, expected = _trial_progress(trial, done_keys, models, question_ids)
-        if done >= expected:
-            completed.append(trial)
-    return completed
+        done, expected = _model_trial_progress(
+            model, trial, raw_df, question_ids, retry_max_tokens
+        )
+        if done < expected:
+            return False
+    return True
+
+
+def _completed_models(
+    models: list[str],
+    trials: int,
+    raw_df: pd.DataFrame,
+    question_ids: list[int],
+    retry_max_tokens: int,
+) -> list[str]:
+    return [
+        model
+        for model in models
+        if _model_is_complete(model, trials, raw_df, question_ids, retry_max_tokens)
+    ]
 
 
 def _load_metadata(paths: RunPaths) -> dict:
@@ -269,9 +352,15 @@ def _save_metadata(paths: RunPaths, metadata: dict) -> None:
     paths.metadata_json.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
+def _default_max_tokens(cfg: dict) -> int | None:
+    sampling = cfg.get("sampling") or {}
+    value = sampling.get("max_tokens")
+    return int(value) if value is not None else None
+
+
 def _run_task(task: EvalTask) -> dict:
     prompt = format_prompt(task.question_row)
-    output = chat_with_retry(prompt, model=task.model)
+    output = chat_with_retry(prompt, model=task.model, max_tokens=task.max_tokens)
     pred = extract_answer_from_row(output, task.options) or ""
     return {
         "trial": task.trial,
@@ -279,36 +368,129 @@ def _run_task(task: EvalTask) -> dict:
         "question_id": task.question_id,
         "question_category": task.category,
         "correct_answer": task.correct_answer,
+        "attempt": task.attempt,
+        "max_tokens": task.max_tokens if task.max_tokens is not None else "",
+        "parse_ok": bool(pred),
         "prompt": prompt,
         "raw_output": output,
         "parsed_answer": pred,
     }
 
 
-def _build_pending_tasks(
+def _build_initial_tasks(
+    model: str,
     trial: int,
-    models: list[str],
     df: pd.DataFrame,
-    writer: _RunWriter,
+    raw_df: pd.DataFrame,
+    default_max_tokens: int | None,
 ) -> list[EvalTask]:
     tasks: list[EvalTask] = []
-    for model in models:
-        for _, row in df.iterrows():
-            qid = int(row["question_id"])
-            if writer.is_done(trial, model, qid):
+    for _, row in df.iterrows():
+        qid = int(row["question_id"])
+        if not raw_df.empty:
+            has_initial = not raw_df[
+                (raw_df["trial"] == trial)
+                & (raw_df["llm_model"] == model)
+                & (raw_df["question_id"] == qid)
+                & (raw_df["attempt"] == 1)
+            ].empty
+            if has_initial:
                 continue
-            tasks.append(
-                EvalTask(
-                    trial=trial,
-                    model=model,
-                    question_id=qid,
-                    category=row["category"],
-                    options=row["options"],
-                    correct_answer=str(row["answer"]).strip().upper(),
-                    question_row=row,
-                )
+        tasks.append(
+            EvalTask(
+                trial=trial,
+                model=model,
+                question_id=qid,
+                category=row["category"],
+                options=row["options"],
+                correct_answer=str(row["answer"]).strip().upper(),
+                question_row=row,
+                attempt=1,
+                max_tokens=default_max_tokens,
             )
+        )
     return tasks
+
+
+def _build_retry_tasks(
+    model: str,
+    trial: int,
+    df: pd.DataFrame,
+    raw_df: pd.DataFrame,
+    retry_max_tokens: int,
+) -> list[EvalTask]:
+    if retry_max_tokens <= 0 or raw_df.empty:
+        return []
+    tasks: list[EvalTask] = []
+    for _, row in df.iterrows():
+        qid = int(row["question_id"])
+        rows = raw_df[
+            (raw_df["trial"] == trial)
+            & (raw_df["llm_model"] == model)
+            & (raw_df["question_id"] == qid)
+        ]
+        if rows.empty:
+            continue
+        attempt1 = rows[rows["attempt"] == 1].iloc[-1]
+        parsed = "" if pd.isna(attempt1.parsed_answer) else str(attempt1.parsed_answer).strip()
+        if parsed:
+            continue
+        if not rows[rows["attempt"] == 2].empty:
+            continue
+        tasks.append(
+            EvalTask(
+                trial=trial,
+                model=model,
+                question_id=qid,
+                category=row["category"],
+                options=row["options"],
+                correct_answer=str(row["answer"]).strip().upper(),
+                question_row=row,
+                attempt=2,
+                max_tokens=retry_max_tokens,
+            )
+        )
+    return tasks
+
+
+def _run_pending_batch(
+    pending: list[EvalTask],
+    writer: _RunWriter,
+    workers: int,
+    *,
+    trial: int,
+    trials: int,
+    model: str,
+    label: str,
+) -> bool:
+    if not pending:
+        return True
+
+    completed_count = 0
+    executor = ThreadPoolExecutor(max_workers=workers)
+    futures = {executor.submit(_run_task, task): task for task in pending}
+    try:
+        for future in as_completed(futures):
+            task = futures[future]
+            record = future.result()
+            writer.record(record)
+            completed_count += 1
+            print(
+                f"[{model}] trial {trial}/{trials} {label} "
+                f"question id={task.question_id} "
+                f"({completed_count}/{len(pending)})"
+            )
+    except KeyboardInterrupt:
+        print("\nInterrupted — progress saved. Resume with: --continue --run-id <id>")
+        executor.shutdown(wait=False, cancel_futures=True)
+        return False
+    else:
+        executor.shutdown(wait=True)
+        return True
+
+
+def _reload_raw(paths: RunPaths) -> pd.DataFrame:
+    return _load_raw_df(paths.raw_responses_csv)
 
 
 def evaluate_run(
@@ -321,10 +503,12 @@ def evaluate_run(
     continue_run: bool = False,
     max_workers: int | None = None,
 ) -> RunPaths:
-    """Run trial-by-trial with parallel API calls and resumable progress."""
+    """Finish each model (all trials) before the next. Retry parse failures after each trial."""
     cfg = load_inference_config()
     trials = n_trials if n_trials is not None else int(cfg["n_trials"])
     workers = max_workers if max_workers is not None else int(cfg.get("max_workers", 4))
+    default_max_tokens = _default_max_tokens(cfg)
+    retry_max_tokens = int(cfg.get("retry_parse_max_tokens", 4096))
 
     if continue_run:
         if run_id:
@@ -353,14 +537,11 @@ def evaluate_run(
             df = df.head(limit)
 
     question_ids = [int(qid) for qid in df["question_id"].tolist()]
-    done_keys = _load_existing_raw_keys(paths.raw_responses_csv)
-    results_state = _load_results_state(paths.results_csv, models, df, trials)
-    _sync_results_from_raw(paths.raw_responses_csv, results_state)
+    raw_df = _reload_raw(paths)
+    results_state = _load_results_state(paths.results_csv, trials)
+    _sync_results_from_raw(raw_df, results_state, df, trials)
+    writer = _RunWriter(paths, results_state, trials, df)
 
-    writer = _RunWriter(paths, results_state, trials)
-    writer.seed_done_keys(done_keys)
-
-    completed = _completed_trials(trials, done_keys, models, question_ids)
     metadata.update(
         {
             "models": models,
@@ -368,7 +549,10 @@ def evaluate_run(
             "max_workers": workers,
             "inference_config": cfg,
             "dataset_rows": len(df),
-            "completed_trials": completed,
+            "run_order": "model_first",
+            "completed_models": _completed_models(
+                models, trials, raw_df, question_ids, retry_max_tokens
+            ),
             "status": "in_progress",
         }
     )
@@ -376,65 +560,112 @@ def evaluate_run(
         metadata["started_at"] = datetime.now(timezone.utc).isoformat()
     _save_metadata(paths, metadata)
 
-    expected_per_trial = _expected_calls(models, len(df))
-    total_models = len(models)
     total_questions = len(df)
 
-    for trial in range(1, trials + 1):
-        done, expected = _trial_progress(trial, writer._done_keys, models, question_ids)
-        if done >= expected:
-            print(f"\n=== Trial {trial}/{trials}: already complete, skipping ===")
-            continue
+    try:
+        for model_idx, model in enumerate(models, start=1):
+            raw_df = _reload_raw(paths)
+            if _model_is_complete(model, trials, raw_df, question_ids, retry_max_tokens):
+                print(f"\n=== Model {model_idx}/{len(models)}: {model} — complete, skipping ===")
+                continue
 
-        pending = _build_pending_tasks(trial, models, df, writer)
-        print(
-            f"\n=== Trial {trial}/{trials}: "
-            f"{len(pending)} calls remaining ({done}/{expected} already done) ==="
-        )
-        metadata["current_trial"] = trial
-        metadata["completed_trials"] = _completed_trials(
-            trials, writer._done_keys, models, question_ids
-        )
-        _save_metadata(paths, metadata)
+            print(f"\n=== Model {model_idx}/{len(models)}: {model} ===")
+            metadata["current_model"] = model
+            _save_metadata(paths, metadata)
 
-        completed_count = 0
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(_run_task, task): task for task in pending}
-            for future in as_completed(futures):
-                task = futures[future]
-                record = future.result()
-                writer.record(record)
-                completed_count += 1
-                print(
-                    f"[trial {trial}/{trials}] [{task.model}] "
-                    f"question id={task.question_id} "
-                    f"({completed_count}/{len(pending)})"
+            for trial in range(1, trials + 1):
+                raw_df = _reload_raw(paths)
+                done, expected = _model_trial_progress(
+                    model, trial, raw_df, question_ids, retry_max_tokens
                 )
+                if done >= expected:
+                    print(f"  Trial {trial}/{trials}: already complete, skipping")
+                    continue
 
-        done, expected = _trial_progress(trial, writer._done_keys, models, question_ids)
-        if done >= expected:
-            completed = _completed_trials(trials, writer._done_keys, models, question_ids)
-            metadata["completed_trials"] = completed
-            metadata["current_trial"] = trial
-            metadata["status"] = "in_progress"
-            print(f"Trial {trial} complete ({expected_per_trial} calls).")
-        else:
-            metadata["status"] = "interrupted"
-            metadata["completed_trials"] = _completed_trials(
-                trials, writer._done_keys, models, question_ids
+                initial = _build_initial_tasks(
+                    model, trial, df, raw_df, default_max_tokens
+                )
+                if initial:
+                    print(
+                        f"  Trial {trial}/{trials}: initial pass, "
+                        f"{len(initial)} calls (max_tokens={default_max_tokens})"
+                    )
+                    metadata["current_trial"] = trial
+                    _save_metadata(paths, metadata)
+                    ok = _run_pending_batch(
+                        initial,
+                        writer,
+                        workers,
+                        trial=trial,
+                        trials=trials,
+                        model=model,
+                        label="initial",
+                    )
+                    if not ok:
+                        metadata["status"] = "interrupted"
+                        _save_metadata(paths, metadata)
+                        return paths
+
+                raw_df = _reload_raw(paths)
+                retries = _build_retry_tasks(
+                    model, trial, df, raw_df, retry_max_tokens
+                )
+                if retries:
+                    print(
+                        f"  Trial {trial}/{trials}: parse retry, "
+                        f"{len(retries)} calls (max_tokens={retry_max_tokens})"
+                    )
+                    ok = _run_pending_batch(
+                        retries,
+                        writer,
+                        workers,
+                        trial=trial,
+                        trials=trials,
+                        model=model,
+                        label="parse-retry",
+                    )
+                    if not ok:
+                        metadata["status"] = "interrupted"
+                        _save_metadata(paths, metadata)
+                        return paths
+
+                raw_df = _reload_raw(paths)
+                done, expected = _model_trial_progress(
+                    model, trial, raw_df, question_ids, retry_max_tokens
+                )
+                if done < expected:
+                    metadata["status"] = "interrupted"
+                    metadata["completed_models"] = _completed_models(
+                        models, trials, raw_df, question_ids, retry_max_tokens
+                    )
+                    _save_metadata(paths, metadata)
+                    print(
+                        f"  Trial {trial}/{trials} incomplete for {model} "
+                        f"({done}/{expected}). Re-run with --continue."
+                    )
+                    return paths
+                print(f"  Trial {trial}/{trials} complete for {model}.")
+
+            metadata["completed_models"] = _completed_models(
+                models, trials, _reload_raw(paths), question_ids, retry_max_tokens
             )
             _save_metadata(paths, metadata)
             print(
-                f"Trial {trial} incomplete ({done}/{expected}). "
-                f"Re-run with --continue to resume this trial only."
+                f"Model {model} complete "
+                f"({trials} trials × {total_questions} questions)."
             )
-            return paths
 
+    except KeyboardInterrupt:
+        metadata["status"] = "interrupted"
+        metadata["completed_models"] = _completed_models(
+            models, trials, _reload_raw(paths), question_ids, retry_max_tokens
+        )
         _save_metadata(paths, metadata)
+        print("\nInterrupted — progress saved. Resume with: --continue --run-id <id>")
+        return paths
 
     metadata["status"] = "complete"
-    metadata["current_trial"] = trials
-    metadata["completed_trials"] = list(range(1, trials + 1))
+    metadata["completed_models"] = list(models)
     _save_metadata(paths, metadata)
-    print(f"\nAll trials complete. Run directory: {paths.run_dir}")
+    print(f"\nAll models complete. Run directory: {paths.run_dir}")
     return paths

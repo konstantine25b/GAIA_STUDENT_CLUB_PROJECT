@@ -68,6 +68,7 @@ def main() -> None:
     print(f"\nRun directory: {paths.run_dir}")
     print(f"Results: {paths.results_csv}")
     print(f"Raw responses: {paths.raw_responses_csv}")
+    print(f"Parse log: {paths.parse_log_csv}")
 
 
 if __name__ == "__main__":

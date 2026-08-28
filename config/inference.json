@@ -2,6 +2,7 @@
   "sampling": {
     "max_tokens": 1024
   },
+  "retry_parse_max_tokens": 8192,
   "n_trials": 10,
   "max_workers": 4,
   "retry_on_api_error": 3,

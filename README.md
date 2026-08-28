@@ -24,30 +24,37 @@ Each full run writes to one folder:
 
 ```
 results/runs/<run_timestamp>/
-  results.csv           # summary: one row per (model, question)
-  raw_responses.csv     # every API call; appended after each trial round
+  results.csv           # summary: one row per (model, question), includes prompt
+  raw_responses.csv     # every API call (initial + parse retry)
+  parse_log.csv         # parse pass/fail audit with max_tokens per attempt
   run_metadata.json
 ```
 
-### Run order
+### Run order (model-first)
 
-For each **trial** `1 … n_trials`:
+For each **model** (finish completely before the next):
 
-1. Model 1 → all 280 questions  
-2. Model 2 → all 280 questions  
-3. …  
-4. Model N → all 280 questions  
-5. **Append** that trial’s rows to `raw_responses.csv` and update `results.csv`
+1. Trial 1 → all 280 questions (parallel)  
+2. **Parse retry** at end of trial — only questions that failed parsing, with `retry_parse_max_tokens`  
+3. Trials 2–10 same pattern  
+4. Next model
 
 ### `results.csv`
 
-`llm_model`, `question_category`, `question_id`, `options`, `correct_answer`,
+`llm_model`, `question_category`, `question_id`, `options`, `correct_answer`, **`prompt`**,
 `it_1_ans` … `it_10_ans`, `correct_answered_num`, `accuracy`
 
 ### `raw_responses.csv`
 
 `trial`, `llm_model`, `question_id`, `question_category`, `correct_answer`,
-`prompt`, `raw_output`, `parsed_answer`
+`attempt`, `max_tokens`, `parse_ok`, `prompt`, `raw_output`, `parsed_answer`
+
+### `parse_log.csv`
+
+`trial`, `llm_model`, `question_id`, `attempt`, `max_tokens`, `parse_ok`,
+`parsed_answer`, `correct_answer`
+
+One row per API attempt. `attempt=1` is the normal pass; `attempt=2` is the end-of-trial parse retry.
 
 ## Inference parameters
 
@@ -57,7 +64,8 @@ Configured in `config/inference.json`.
 
 | Parameter | Value | Why |
 |-----------|-------|-----|
-| `max_tokens` | `1024` | Caps completion length — main lever for API cost |
+| `max_tokens` | `1024` | Initial pass output cap |
+| `retry_parse_max_tokens` | `4096` | End-of-trial retry when parsing fails |
 
 Other sampling fields are omitted so the API uses its defaults (`temperature`, `top_p`, etc.).
 
