@@ -104,9 +104,11 @@ class _RunWriter:
             self._append_csv(self.paths.parse_log_csv, _parse_log_row(record), PARSE_LOG_COLUMNS)
 
             self._ensure_result_row(model, qid, prompt)
+            result_row = self.results_state[_result_key(model, qid)]
+            result_row[f"it_{trial}_raw"] = record.get("raw_output") or ""
             parsed = record.get("parsed_answer") or ""
             if parsed:
-                self.results_state[_result_key(model, qid)][f"it_{trial}_ans"] = parsed
+                result_row[f"it_{trial}_ans"] = parsed
             self._flush_results_unlocked()
 
     def _append_csv(self, path: Path, record: dict, columns: list[str]) -> None:
@@ -137,7 +139,11 @@ def _parse_log_row(record: dict) -> dict:
 
 
 def _trial_columns(n_trials: int) -> list[str]:
-    return [f"it_{i}_ans" for i in range(1, n_trials + 1)]
+    columns: list[str] = []
+    for i in range(1, n_trials + 1):
+        columns.append(f"it_{i}_ans")
+        columns.append(f"it_{i}_raw")
+    return columns
 
 
 def results_columns(n_trials: int) -> list[str]:
@@ -201,6 +207,7 @@ def _empty_result_row(model: str, row: pd.Series, n_trials: int) -> dict:
     }
     for i in range(1, n_trials + 1):
         result[f"it_{i}_ans"] = ""
+        result[f"it_{i}_raw"] = ""
     return result
 
 
@@ -257,6 +264,11 @@ def _sync_results_from_raw(
         if isinstance(prompt, str) and prompt and not results_state[key].get("prompt"):
             results_state[key]["prompt"] = prompt
         for _, attempt_row in group.iterrows():
+            raw_output = (
+                "" if pd.isna(attempt_row.raw_output) else str(attempt_row.raw_output)
+            )
+            if raw_output:
+                results_state[key][f"it_{int(trial)}_raw"] = raw_output
             parsed = "" if pd.isna(attempt_row.parsed_answer) else str(attempt_row.parsed_answer)
             if parsed:
                 results_state[key][f"it_{int(trial)}_ans"] = parsed
@@ -268,6 +280,9 @@ def _load_results_state(results_csv: Path, n_trials: int) -> dict[tuple[str, int
     state: dict[tuple[str, int], dict] = {}
     for record in pd.read_csv(results_csv).to_dict(orient="records"):
         key = _result_key(str(record["llm_model"]), int(record["question_id"]))
+        for i in range(1, n_trials + 1):
+            record.setdefault(f"it_{i}_ans", "")
+            record.setdefault(f"it_{i}_raw", "")
         state[key] = record
     return state
 
