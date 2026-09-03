@@ -1,8 +1,8 @@
 {
   "sampling": {
-    "max_tokens": 2048
+    "max_tokens": 8192
   },
-  "retry_parse_max_tokens": [4096, 8192, null],
+  "retry_parse_max_tokens": [null],
   "n_trials": 10,
   "max_workers": 4,
   "retry_on_api_error": 3,
