@@ -26,6 +26,28 @@ SAMPLING_KEYS = (
     "presence_penalty",
 )
 
+# Force a JSON object so the letter is read from the "answer" field, not regex.
+JSON_ANSWER_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "mmlu_pro_answer",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "reasoning": {"type": "string"},
+                "answer": {
+                    "type": "string",
+                    "enum": list("ABCDEFGHIJ"),
+                    "description": "Exactly one letter such as A or C, and nothing else.",
+                },
+            },
+            "required": ["reasoning", "answer"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 client = OpenAI(
     api_key=os.environ["API_KEY"],
     base_url=f"{BASE_URL}/v1",
@@ -80,18 +102,20 @@ def chat(
     omit_max_tokens: bool = False,
 ) -> str:
     cfg = load_inference_config()
+    kwargs = _sampling_kwargs(
+        cfg,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+        omit_max_tokens=omit_max_tokens,
+    )
+    kwargs["response_format"] = JSON_ANSWER_RESPONSE_FORMAT
     response = client.chat.completions.create(
         model=model or DEFAULT_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        **_sampling_kwargs(
-            cfg,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            omit_max_tokens=omit_max_tokens,
-        ),
+        **kwargs,
     )
     return response.choices[0].message.content or ""
 

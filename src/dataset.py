@@ -9,11 +9,11 @@ from src.paths import DATASET_CSV
 
 LETTERS = "ABCDEFGHIJ"
 
-# Concise prompt: shorter model outputs = lower API cost (cap with max_tokens in config).
 INSTRUCTION_TEMPLATE = (
-    'The following are multiple choice questions about {category}. '
-    'Think briefly (at most a few sentences), then end with exactly: '
-    '"The answer is (X)" where X is the correct letter A-J.\n\n'
+    "The following are multiple choice questions about {category}. "
+    "Reason through the question, then output ONLY a JSON object with this exact shape:\n"
+    '{{"reasoning": "<your reasoning>", "answer": "<letter>"}}\n'
+    'The "answer" value must be exactly one letter such as A or C, and nothing else.\n\n'
 )
 
 
@@ -23,10 +23,9 @@ def load_dataset(csv_path: Path | None = None) -> pd.DataFrame:
 
 
 def format_question_block(question: str, options: list[str]) -> str:
-    block = f"Question: {question}\nOptions: "
+    block = f"Question: {question}\nOptions:\n"
     for i, opt in enumerate(options):
         block += f"{LETTERS[i]}. {opt}\n"
-    block += "Answer: "
     return block
 
 
